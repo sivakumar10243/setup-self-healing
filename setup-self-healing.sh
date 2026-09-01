@@ -67,7 +67,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="1.0.0"
 
 CONF_DIR="/etc/self-healing"
 CONFIG_FILE="${CONF_DIR}/config.conf"
