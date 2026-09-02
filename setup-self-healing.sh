@@ -747,6 +747,10 @@ handle_unit() {
 
         if [[ "${given_up}" == "1" ]]; then
             logline "SKIP ${name}: retries already exhausted, waiting for it to recover or be fixed manually"
+            # Still down — re-notify. The notifier's own cooldown (COOLDOWN_SECONDS,
+            # default 1800s/30min) throttles this to one actual alert per window
+            # and logs "suppressed" for the rest, so this is safe to call every cycle.
+            "${NOTIFIER}" "${name}" "DOWN" "${attempts}/${MAX_ATTEMPTS}" "$(error_detail "${name}" "${checktype}" "${target}")" || true
             return 0
         fi
 
