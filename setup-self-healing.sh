@@ -9,7 +9,7 @@
 #   1. A persistent watchdog daemon (systemd service, Restart=always) that
 #      polls every service (and every Supervisor job) on a fixed interval.
 #   2. A scripted recovery routine: on detecting a stopped/crashed/unhealthy
-#      service it restarts it, waits, and health-checks — up to 3 attempts,
+#      service it restarts it, waits, and health-checks - up to 3 attempts,
 #      30 seconds apart (configurable). After each attempt it logs the
 #      outcome. If all attempts fail, it stops retrying and sends a
 #      notification (Slack, Google Chat, and/or Email) with service name,
@@ -23,7 +23,14 @@
 #   5. A full event log (checks, restart attempts, recoveries, failures).
 #   6. logrotate config so the event log doesn't grow unbounded.
 #   7. A login MOTD banner showing service + resource health.
-#   8. --uninstall to cleanly remove everything.
+#   8. Disk space monitoring (`df -h`) on configured mountpoints: WARNING at
+#      80% used, CRITICAL at 90%, EMERGENCY at 95% (all thresholds are
+#      configurable). Alerts repeat every 30 minutes (configurable) as long
+#      as usage stays at/above a threshold, and a RESOLVED notice is sent
+#      once usage drops back below the warning threshold. This check is
+#      read-only monitoring only - the script never deletes files, logs, or
+#      anything else to free up space.
+#   9. --uninstall to cleanly remove everything.
 #
 # USAGE
 #   sudo ./setup-self-healing.sh [options]
@@ -49,6 +56,13 @@
 #   --cooldown SECONDS            Minimum seconds between repeat "still down"
 #                                  notifications for the same service once
 #                                  retries are exhausted (default 1800)
+#   --no-disk-check                Disable disk space monitoring entirely.
+#   --disk-mounts "/,/data"        Mountpoints to watch with `df -h` (default "/")
+#   --disk-warn PCT                Warning threshold, percent used (default 80)
+#   --disk-critical PCT            Critical threshold, percent used (default 90)
+#   --disk-emergency PCT           Emergency threshold, percent used (default 95)
+#   --disk-cooldown SECONDS        Repeat interval for an unresolved disk alert
+#                                  at the same severity (default 1800 = 30 min)
 #   --dry-run                     Show what would be done, change nothing.
 #   --uninstall                   Remove all self-healing configuration.
 #   -h, --help                    Show this help.
@@ -120,6 +134,12 @@ MAX_ATTEMPTS="3"
 RETRY_DELAY="30"
 CHECK_INTERVAL="30"
 COOLDOWN_SECONDS="1800"
+DISK_CHECK_ENABLED="1"
+DISK_MOUNTPOINTS="/"
+DISK_WARN_PCT="80"
+DISK_CRITICAL_PCT="90"
+DISK_EMERGENCY_PCT="95"
+DISK_COOLDOWN_SECONDS="1800"
 DRY_RUN="0"
 UNINSTALL="0"
 
@@ -149,6 +169,12 @@ while [[ $# -gt 0 ]]; do
         --retry-delay) RETRY_DELAY="$2"; shift 2 ;;
         --check-interval) CHECK_INTERVAL="$2"; shift 2 ;;
         --cooldown) COOLDOWN_SECONDS="$2"; shift 2 ;;
+        --no-disk-check) DISK_CHECK_ENABLED="0"; shift ;;
+        --disk-mounts) DISK_MOUNTPOINTS="$2"; shift 2 ;;
+        --disk-warn) DISK_WARN_PCT="$2"; shift 2 ;;
+        --disk-critical) DISK_CRITICAL_PCT="$2"; shift 2 ;;
+        --disk-emergency) DISK_EMERGENCY_PCT="$2"; shift 2 ;;
+        --disk-cooldown) DISK_COOLDOWN_SECONDS="$2"; shift 2 ;;
         --dry-run) DRY_RUN="1"; shift ;;
         --uninstall) UNINSTALL="1"; shift ;;
         -h|--help) usage ;;
@@ -162,14 +188,14 @@ error() { echo "[ERROR] $1" >&2; }
 die()   { error "$1"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Interactive mode — if invoked with no CLI options at all and connected to
+# Interactive mode - if invoked with no CLI options at all and connected to
 # a terminal, ask for the settings instead of silently applying defaults.
 # Non-interactive invocations (cron, CI, piped input) skip this and just
 # use the defaults, so automation never hangs waiting on stdin.
 # ---------------------------------------------------------------------------
 
 prompt_for_config() {
-    echo "No options supplied — interactive setup (press Enter to accept the default shown)."
+    echo "No options supplied - interactive setup (press Enter to accept the default shown)."
     echo
 
     read -rp "Extra services to monitor, comma separated [none]: " reply
@@ -188,7 +214,7 @@ prompt_for_config() {
         EMAIL_TO="${reply:-${EMAIL_TO}}"
 
         if [[ -z "${SLACK_WEBHOOK}" && -z "${GOOGLECHAT_WEBHOOK}" && -z "${EMAIL_TO}" ]]; then
-            read -rp "No notification channel entered — alerts will not be sent anywhere. Continue without alerts? [y/N]: " reply
+            read -rp "No notification channel entered - alerts will not be sent anywhere. Continue without alerts? [y/N]: " reply
             case "${reply,,}" in
                 y|yes) break ;;
                 *) echo "Okay, let's set at least one channel (or confirm 'y' to skip)."; echo ;;
@@ -216,7 +242,36 @@ prompt_for_config() {
     COOLDOWN_SECONDS="${reply:-${COOLDOWN_SECONDS}}"
 
     echo
+    read -rp "Enable disk space monitoring (df -h, alerts only - nothing is ever deleted)? [Y/n]: " reply
+    case "${reply,,}" in
+        n|no) DISK_CHECK_ENABLED="0" ;;
+        *) DISK_CHECK_ENABLED="1" ;;
+    esac
+
+    if [[ "${DISK_CHECK_ENABLED}" == "1" ]]; then
+        read -rp "Mountpoints to watch, comma separated [${DISK_MOUNTPOINTS}]: " reply
+        DISK_MOUNTPOINTS="${reply:-${DISK_MOUNTPOINTS}}"
+
+        read -rp "Warning threshold, percent used [${DISK_WARN_PCT}]: " reply
+        DISK_WARN_PCT="${reply:-${DISK_WARN_PCT}}"
+
+        read -rp "Critical threshold, percent used [${DISK_CRITICAL_PCT}]: " reply
+        DISK_CRITICAL_PCT="${reply:-${DISK_CRITICAL_PCT}}"
+
+        read -rp "Emergency threshold, percent used [${DISK_EMERGENCY_PCT}]: " reply
+        DISK_EMERGENCY_PCT="${reply:-${DISK_EMERGENCY_PCT}}"
+
+        read -rp "Repeat interval for an unresolved disk alert, seconds [${DISK_COOLDOWN_SECONDS}]: " reply
+        DISK_COOLDOWN_SECONDS="${reply:-${DISK_COOLDOWN_SECONDS}}"
+    fi
+
+    echo
     log "Using: services=[${EXTRA_SERVICES:-none}] slack=[${SLACK_WEBHOOK:+set}] googlechat=[${GOOGLECHAT_WEBHOOK:+set}] email=[${EMAIL_TO:-none}] max-attempts=${MAX_ATTEMPTS} retry-delay=${RETRY_DELAY}s check-interval=${CHECK_INTERVAL}s cooldown=${COOLDOWN_SECONDS}s"
+    if [[ "${DISK_CHECK_ENABLED}" == "1" ]]; then
+        log "Disk monitoring: mounts=[${DISK_MOUNTPOINTS}] warn=${DISK_WARN_PCT}% critical=${DISK_CRITICAL_PCT}% emergency=${DISK_EMERGENCY_PCT}% repeat=${DISK_COOLDOWN_SECONDS}s"
+    else
+        log "Disk monitoring: disabled"
+    fi
     echo
 }
 
@@ -350,7 +405,7 @@ EMAIL_FROM="${EMAIL_FROM:-${EXISTING_EMAIL_FROM:-self-healing@$(hostname -f 2>/d
 log "Writing ${CONFIG_FILE}..."
 if [[ "${DRY_RUN}" != "1" ]]; then
     cat > "${CONFIG_FILE}" <<EOF
-# Managed by setup-self-healing.sh — edit and re-run script, or edit directly.
+# Managed by setup-self-healing.sh - edit and re-run script, or edit directly.
 EXISTING_SLACK_WEBHOOK="${SLACK_WEBHOOK}"
 EXISTING_GOOGLECHAT_WEBHOOK="${GOOGLECHAT_WEBHOOK}"
 EXISTING_EMAIL_TO="${EMAIL_TO}"
@@ -359,6 +414,12 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS}"
 RETRY_DELAY="${RETRY_DELAY}"
 CHECK_INTERVAL="${CHECK_INTERVAL}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS}"
+DISK_CHECK_ENABLED="${DISK_CHECK_ENABLED}"
+DISK_MOUNTPOINTS="${DISK_MOUNTPOINTS}"
+DISK_WARN_PCT="${DISK_WARN_PCT}"
+DISK_CRITICAL_PCT="${DISK_CRITICAL_PCT}"
+DISK_EMERGENCY_PCT="${DISK_EMERGENCY_PCT}"
+DISK_COOLDOWN_SECONDS="${DISK_COOLDOWN_SECONDS}"
 EOF
     chmod 640 "${CONFIG_FILE}"
 fi
@@ -368,7 +429,7 @@ if [[ -n "${EMAIL_TO}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Discover services — only currently-active ones are auto-monitored;
+# Discover services - only currently-active ones are auto-monitored;
 # anything passed via --services is added regardless of current state.
 # ---------------------------------------------------------------------------
 
@@ -420,10 +481,10 @@ if [[ "${#MONITORED_SERVICES[@]}" -eq 0 ]]; then
     warn "No active supported services detected. Framework will still be installed."
 elif [[ "${INTERACTIVE}" == "1" ]]; then
     echo
-    log "Found these active services — choose which to self-heal:"
+    log "Found these active services - choose which to self-heal:"
     CONFIRMED_SERVICES=()
     for svc in "${MONITORED_SERVICES[@]}"; do
-        read -rp "  ${svc} (running) — add self-healing for this service? [Y/n]: " reply
+        read -rp "  ${svc} (running) - add self-healing for this service? [Y/n]: " reply
         case "${reply,,}" in
             n|no) log "    skipping ${svc}" ;;
             *) CONFIRMED_SERVICES+=("${svc}") ;;
@@ -437,7 +498,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Supervisor jobs — discovered via supervisorctl, monitored the same way
+# Supervisor jobs - discovered via supervisorctl, monitored the same way
 # ---------------------------------------------------------------------------
 
 SUPERVISOR_JOBS=()
@@ -513,7 +574,7 @@ if [[ -f "${SERVICES_FILE}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Notifier script — Slack + Google Chat + Email
+# Notifier script - Slack + Google Chat + Email
 # ---------------------------------------------------------------------------
 
 log "Installing ${NOTIFIER_SCRIPT}..."
@@ -537,6 +598,11 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
 [[ -f "${CONFIG_FILE}" ]] && source "${CONFIG_FILE}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-1800}"
+DISK_COOLDOWN_SECONDS="${DISK_COOLDOWN_SECONDS:-1800}"
+case "${STATUS}" in
+    DISK_*) ACTIVE_COOLDOWN="${DISK_COOLDOWN_SECONDS}" ;;
+    *)      ACTIVE_COOLDOWN="${COOLDOWN_SECONDS}" ;;
+esac
 # Keyed by status too, so a RECOVERED notification is never suppressed by
 # the cooldown of the DOWN notification that preceded it (or vice versa).
 NOTIFY_FLAG="${STATE_DIR}/${SERVICE_NAME}.${STATUS,,}.last_notify"
@@ -549,21 +615,38 @@ LAST=0
 [[ -f "${NOTIFY_FLAG}" ]] && LAST="$(<"${NOTIFY_FLAG}")"
 [[ "${LAST}" =~ ^[0-9]+$ ]] || LAST=0
 
-# RECOVERED is a one-time transition, not repeat spam, so it is never
-# cooldown-suppressed — it must always get through so it can clear the
-# DOWN cooldown below. Only repeated "still down" alerts get throttled.
-if [[ "${STATUS}" != "RECOVERED" ]] && (( NOW - LAST < COOLDOWN_SECONDS )); then
+# RECOVERED/DISK_RECOVERED are one-time transitions, not repeat spam, so
+# they are never cooldown-suppressed - they must always get through so
+# they can clear the prior alert's cooldown below. Only repeated "still
+# down"/"still over threshold" alerts get throttled (every ACTIVE_COOLDOWN
+# seconds, e.g. every 30 minutes by default).
+if [[ "${STATUS}" != "RECOVERED" && "${STATUS}" != "DISK_RECOVERED" ]] && (( NOW - LAST < ACTIVE_COOLDOWN )); then
     echo "[${TIMESTAMP}] Notification for ${SERVICE_NAME} (${STATUS}) suppressed (cooldown active)." >> "${LOG_FILE}"
     exit 0
 fi
 
-if [[ "${STATUS}" == "RECOVERED" ]]; then
-    HEADER="RESOLVED"
-    STATUS_EMOJI="✅"
-else
-    HEADER="CRITICAL"
-    STATUS_EMOJI="❌"
-fi
+case "${STATUS}" in
+    RECOVERED|DISK_RECOVERED)
+        HEADER="RESOLVED"
+        STATUS_EMOJI="✅"
+        ;;
+    DISK_WARNING)
+        HEADER="WARNING"
+        STATUS_EMOJI="⚠️"
+        ;;
+    DISK_CRITICAL)
+        HEADER="CRITICAL"
+        STATUS_EMOJI="🔴"
+        ;;
+    DISK_EMERGENCY)
+        HEADER="EMERGENCY"
+        STATUS_EMOJI="🚨"
+        ;;
+    *)
+        HEADER="CRITICAL"
+        STATUS_EMOJI="❌"
+        ;;
+esac
 
 MSG="${STATUS_EMOJI} ${HEADER}: *${SERVICE_NAME}* on *${HOSTNAME_FQDN}*
 Status: *${STATUS}*
@@ -596,7 +679,7 @@ if [[ -n "${EXISTING_GOOGLECHAT_WEBHOOK:-}" ]] && command -v curl >/dev/null 2>&
 fi
 
 if [[ -n "${EXISTING_EMAIL_TO:-}" ]] && command -v mail >/dev/null 2>&1; then
-    if echo "${MSG}" | mail -s "[self-healing] ${STATUS_EMOJI} ${SERVICE_NAME} on ${HOSTNAME_FQDN} — ${STATUS}" \
+    if echo "${MSG}" | mail -s "[self-healing] ${STATUS_EMOJI} ${SERVICE_NAME} on ${HOSTNAME_FQDN} - ${STATUS}" \
         ${EXISTING_EMAIL_FROM:+-r "${EXISTING_EMAIL_FROM}"} "${EXISTING_EMAIL_TO}" 2>/dev/null; then
         SENT=1
     else
@@ -607,11 +690,15 @@ fi
 if [[ "${SENT}" == "1" ]]; then
     echo "${NOW}" > "${NOTIFY_FLAG}"
     # A confirmed recovery closes out the incident that the last DOWN alert
-    # was about — clear its cooldown so the *next* distinct failure always
+    # was about - clear its cooldown so the *next* distinct failure always
     # alerts, instead of possibly being silently swallowed by a cooldown
     # window left over from an outage that has already been resolved.
     if [[ "${STATUS}" == "RECOVERED" ]]; then
         rm -f "${STATE_DIR}/${SERVICE_NAME}.down.last_notify"
+    elif [[ "${STATUS}" == "DISK_RECOVERED" ]]; then
+        rm -f "${STATE_DIR}/${SERVICE_NAME}.disk_warning.last_notify" \
+              "${STATE_DIR}/${SERVICE_NAME}.disk_critical.last_notify" \
+              "${STATE_DIR}/${SERVICE_NAME}.disk_emergency.last_notify"
     fi
 else
     echo "[${TIMESTAMP}] No notification channel configured/succeeded for ${SERVICE_NAME}." >> "${LOG_FILE}"
@@ -622,7 +709,7 @@ chmod 755 "${NOTIFIER_SCRIPT}"
 fi
 
 # ---------------------------------------------------------------------------
-# Watchdog daemon — owns detection, restart retries, and recovery/give-up
+# Watchdog daemon - owns detection, restart retries, and recovery/give-up
 # state for both systemd services and Supervisor jobs.
 # ---------------------------------------------------------------------------
 
@@ -653,6 +740,11 @@ HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 RETRY_DELAY="${RETRY_DELAY:-30}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
+DISK_CHECK_ENABLED="${DISK_CHECK_ENABLED:-1}"
+DISK_MOUNTPOINTS="${DISK_MOUNTPOINTS:-/}"
+DISK_WARN_PCT="${DISK_WARN_PCT:-80}"
+DISK_CRITICAL_PCT="${DISK_CRITICAL_PCT:-90}"
+DISK_EMERGENCY_PCT="${DISK_EMERGENCY_PCT:-95}"
 
 mkdir -p "${STATE_DIR}" "${LOCK_DIR}"
 touch "${LOG_FILE}"
@@ -711,6 +803,68 @@ error_detail() {
     fi
 }
 
+# --- disk space monitoring --------------------------------------------------
+# Read-only: this only checks `df -h` and notifies. It never deletes files,
+# rotates logs, or frees space on its own.
+
+disk_key() {
+    # Turn a mountpoint into a safe token for state filenames / notifier
+    # "service name", e.g. "/" -> "disk-root", "/data" -> "disk-data".
+    local mp="${1#/}"
+    mp="${mp//\//-}"
+    [[ -z "${mp}" ]] && mp="root"
+    echo "disk-${mp}"
+}
+
+check_disk_usage() {
+    local mount="$1"
+    local key; key="$(disk_key "${mount}")"
+    local state_file="${STATE_DIR}/${key}.state"
+    local lock_file="${LOCK_DIR}/${key}.lock"
+
+    (
+        flock -x 200
+
+        local used total pct
+        read -r used total pct <<< "$(df -hP "${mount}" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $3,$2,$5}')"
+        if [[ ! "${pct}" =~ ^[0-9]+$ ]]; then
+            logline "DISK CHECK ${mount}: unable to read usage via df -h (bad mountpoint?)"
+            return 0
+        fi
+
+        local level="OK"
+        if (( pct >= DISK_EMERGENCY_PCT )); then
+            level="EMERGENCY"
+        elif (( pct >= DISK_CRITICAL_PCT )); then
+            level="CRITICAL"
+        elif (( pct >= DISK_WARN_PCT )); then
+            level="WARNING"
+        fi
+
+        local prev_level="OK"
+        [[ -f "${state_file}" ]] && prev_level="$(<"${state_file}")"
+
+        logline "DISK CHECK ${mount}: ${pct}% used (${used}/${total}), level=${level}"
+
+        if [[ "${level}" == "OK" ]]; then
+            if [[ "${prev_level}" != "OK" ]]; then
+                echo "OK" > "${state_file}"
+                logline "DISK RECOVERED ${mount}: back to ${pct}% used, below ${DISK_WARN_PCT}% warning threshold"
+                "${NOTIFIER}" "${key}" "DISK_RECOVERED" "-" \
+                    "Disk usage on ${mount} (${HOSTNAME_FQDN}) is now ${pct}% used (${used}/${total}), below the ${DISK_WARN_PCT}% warning threshold" || true
+            fi
+            return 0
+        fi
+
+        echo "${level}" > "${state_file}"
+        # Re-notify every check; the notifier's own DISK_COOLDOWN_SECONDS
+        # (default 1800s/30min) throttles this to one actual alert per
+        # window per severity level, same pattern as service DOWN alerts.
+        "${NOTIFIER}" "${key}" "DISK_${level}" "-" \
+            "Disk usage on ${mount} (${HOSTNAME_FQDN}) is ${pct}% used (${used}/${total}) - threshold ${level,,}: warn=${DISK_WARN_PCT}% critical=${DISK_CRITICAL_PCT}% emergency=${DISK_EMERGENCY_PCT}%" || true
+    ) 200>"${lock_file}"
+}
+
 # --- per-service handling ---------------------------------------------------
 
 handle_unit() {
@@ -747,7 +901,7 @@ handle_unit() {
 
         if [[ "${given_up}" == "1" ]]; then
             logline "SKIP ${name}: retries already exhausted, waiting for it to recover or be fixed manually"
-            # Still down — re-notify. The notifier's own cooldown (COOLDOWN_SECONDS,
+            # Still down - re-notify. The notifier's own cooldown (COOLDOWN_SECONDS,
             # default 1800s/30min) throttles this to one actual alert per window
             # and logs "suppressed" for the rest, so this is safe to call every cycle.
             "${NOTIFIER}" "${name}" "DOWN" "${attempts}/${MAX_ATTEMPTS}" "$(error_detail "${name}" "${checktype}" "${target}")" || true
@@ -768,7 +922,7 @@ handle_unit() {
                 { echo "attempts=${attempts}"; echo "given_up=${given_up}"; } > "${state_file}"
                 break
             else
-                logline "RESTART ${name}: attempt ${attempts}/${MAX_ATTEMPTS} did not bring it healthy — $(error_detail "${name}" "${checktype}" "${target}")"
+                logline "RESTART ${name}: attempt ${attempts}/${MAX_ATTEMPTS} did not bring it healthy - $(error_detail "${name}" "${checktype}" "${target}")"
             fi
         done
 
@@ -800,6 +954,21 @@ while true; do
             [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
         done
     fi
+
+    if [[ "${DISK_CHECK_ENABLED}" == "1" ]]; then
+        disk_pids=()
+        IFS=',' read -ra _DISK_MOUNTS <<< "${DISK_MOUNTPOINTS}"
+        for mount in "${_DISK_MOUNTS[@]}"; do
+            mount="$(echo "${mount}" | xargs)"
+            [[ -z "${mount}" ]] && continue
+            check_disk_usage "${mount}" &
+            disk_pids+=($!)
+        done
+        for pid in "${disk_pids[@]:-}"; do
+            [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
+        done
+    fi
+
     sleep "${CHECK_INTERVAL}"
 done
 EOF
@@ -860,6 +1029,13 @@ BASE_DIR="/var/lib/self-healing"
 STATE_DIR="${BASE_DIR}/state"
 HEARTBEAT_FILE="${BASE_DIR}/heartbeat"
 SERVICES_FILE="/etc/self-healing/services.conf"
+CONFIG_FILE="/etc/self-healing/config.conf"
+[[ -f "${CONFIG_FILE}" ]] && source "${CONFIG_FILE}"
+DISK_CHECK_ENABLED="${DISK_CHECK_ENABLED:-1}"
+DISK_MOUNTPOINTS="${DISK_MOUNTPOINTS:-/}"
+DISK_WARN_PCT="${DISK_WARN_PCT:-80}"
+DISK_CRITICAL_PCT="${DISK_CRITICAL_PCT:-90}"
+DISK_EMERGENCY_PCT="${DISK_EMERGENCY_PCT:-95}"
 
 echo ""
 echo "==================================================================="
@@ -869,14 +1045,38 @@ echo "==================================================================="
 LOAD="$(uptime 2>/dev/null | awk -F'load average:' '{print $2}' | xargs || true)"
 MEM_INFO="$(free -m 2>/dev/null | awk '/^Mem:/{used=$3; total=$2; pct=(total>0)?used*100/total:0; printf "%d %d %d", used, total, pct}')"
 read -r MEM_USED MEM_TOTAL MEM_PCT <<< "${MEM_INFO:-0 0 0}"
-DISK_INFO="$(df -hP / 2>/dev/null | awk 'NR==2{printf "%s %s %s", $3,$2,$5}')"
-read -r DISK_USED DISK_TOTAL DISK_PCT <<< "${DISK_INFO:-? ? ?}"
 OS_INFO="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2);print $2;exit}' /etc/os-release 2>/dev/null)"
 
 echo " OS: ${OS_INFO:-unknown}"
 echo " CPU Load: ${LOAD:-N/A}"
 echo " Memory: ${MEM_USED}MB / ${MEM_TOTAL}MB (${MEM_PCT}% used)"
-echo " Root Disk: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT} used)"
+
+if [[ "${DISK_CHECK_ENABLED}" == "1" ]]; then
+    IFS=',' read -ra _MOTD_MOUNTS <<< "${DISK_MOUNTPOINTS}"
+    for _mp in "${_MOTD_MOUNTS[@]}"; do
+        _mp="$(echo "${_mp}" | xargs)"
+        [[ -z "${_mp}" ]] && continue
+        DISK_INFO="$(df -hP "${_mp}" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $3,$2,$5}')"
+        read -r DISK_USED DISK_TOTAL DISK_PCT <<< "${DISK_INFO:-? ? 0}"
+        if [[ "${DISK_PCT}" =~ ^[0-9]+$ ]]; then
+            if (( DISK_PCT >= DISK_EMERGENCY_PCT )); then
+                echo " Disk ${_mp}: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT}% used) - [EMERGENCY]"
+            elif (( DISK_PCT >= DISK_CRITICAL_PCT )); then
+                echo " Disk ${_mp}: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT}% used) - [CRITICAL]"
+            elif (( DISK_PCT >= DISK_WARN_PCT )); then
+                echo " Disk ${_mp}: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT}% used) - [WARNING]"
+            else
+                echo " Disk ${_mp}: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT}% used)"
+            fi
+        else
+            echo " Disk ${_mp}: unable to read usage"
+        fi
+    done
+else
+    DISK_INFO="$(df -hP / 2>/dev/null | awk 'NR==2{printf "%s %s %s", $3,$2,$5}')"
+    read -r DISK_USED DISK_TOTAL DISK_PCT <<< "${DISK_INFO:-? ? ?}"
+    echo " Root Disk: ${DISK_USED} / ${DISK_TOTAL} (${DISK_PCT} used) - disk monitoring disabled"
+fi
 
 if [[ -f "${HEARTBEAT_FILE}" ]]; then
     NOW="$(date +%s)"
@@ -884,7 +1084,7 @@ if [[ -f "${HEARTBEAT_FILE}" ]]; then
     [[ "${LAST}" =~ ^[0-9]+$ ]] || LAST=0
     AGE=$((NOW - LAST))
     if (( AGE > 300 )); then
-        echo " Watchdog heartbeat: STALE (${AGE}s old) — self-healing watchdog may be down!"
+        echo " Watchdog heartbeat: STALE (${AGE}s old) - self-healing watchdog may be down!"
     else
         echo " Watchdog heartbeat: OK (${AGE}s ago)"
     fi
@@ -946,7 +1146,7 @@ systemctl daemon-reload
 
 log "Validating generated unit..."
 systemd-analyze verify "${WATCHDOG_SERVICE}" || \
-    warn "systemd-analyze verify reported issues above — review before relying on this in production."
+    warn "systemd-analyze verify reported issues above - review before relying on this in production."
 
 log "Enabling and starting watchdog..."
 systemctl enable --now self-healing-watchdog.service
@@ -970,6 +1170,11 @@ fi
 echo " Restart policy:    ${MAX_ATTEMPTS} attempts, ${RETRY_DELAY}s apart, then notify + stop retrying"
 echo " Poll interval:     ${CHECK_INTERVAL}s"
 echo " Notify cooldown:   ${COOLDOWN_SECONDS}s per service (once retries are exhausted)"
+if [[ "${DISK_CHECK_ENABLED}" == "1" ]]; then
+    echo " Disk monitoring:   mounts=[${DISK_MOUNTPOINTS}] warn=${DISK_WARN_PCT}% critical=${DISK_CRITICAL_PCT}% emergency=${DISK_EMERGENCY_PCT}% repeat every ${DISK_COOLDOWN_SECONDS}s (read-only, never deletes anything)"
+else
+    echo " Disk monitoring:   disabled"
+fi
 echo " Slack configured:       $([[ -n "${SLACK_WEBHOOK}" ]] && echo yes || echo no)"
 echo " Google Chat configured: $([[ -n "${GOOGLECHAT_WEBHOOK}" ]] && echo yes || echo no)"
 echo " Email configured:       $([[ -n "${EMAIL_TO}" ]] && echo "yes (${EMAIL_TO})" || echo no)"
