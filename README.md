@@ -111,6 +111,11 @@ services (nginx, apache2, MySQL/MariaDB, Redis, PHP-FPM, Meilisearch,
 cron, Supervisor) and only picks the ones that are **actually installed
 and currently running** - plus anything you added with `--services`.
 
+Common aliases are de-duplicated automatically, so you won't see the
+same service listed twice under different names: if `mariadb` is found,
+`mysql`/`mysqld` are dropped; `apache2` wins over `httpd`; `redis-server`
+wins over `redis`; `cron` wins over `crond`.
+
 If you run it interactively, it asks you to confirm each one it found
 (`Y/n`) before adding it.
 
@@ -195,7 +200,8 @@ log:
 ```
 
 **Disk space alerts work the same way**, just keyed by mountpoint and
-severity instead of by service:
+severity instead of by service. The mountpoint becomes the "service
+name" in the alert (`/` → `disk-root`, `/data` → `disk-data`):
 
 ```
 🚨 EMERGENCY: *disk-root* on *rhel.faveodemo.com*
@@ -236,7 +242,9 @@ Detail: Disk usage on / (rhel.faveodemo.com) is now 74% used (36G/48G), below th
 | `/etc/logrotate.d/self-healing` | Log rotation rules - rotates **daily**, keeps the last **7 days**, compressed. |
 | `/etc/profile.d/99-server-health.sh` | The health summary shown on login. |
 | `/var/lib/self-healing/state/` | Tracks restart attempts / give-up status per service. |
+| `/var/lib/self-healing/locks/` | Per-service `flock` lock files, so overlapping checks never race each other. |
 | `/var/lib/self-healing/heartbeat` | Timestamp updated every check cycle - proves the watchdog is alive. |
+| `/var/lib/self-healing/backup/<timestamp>/` | A snapshot of `services.conf` taken every time you run the installer. |
 | `/var/log/self-healing/events.log` | The full event log. |
 
 ---
@@ -248,6 +256,18 @@ systemctl status self-healing-watchdog.service   # is it running?
 tail -f /var/log/self-healing/events.log         # watch it live
 cat /etc/self-healing/services.conf              # what's being watched
 ```
+
+**Disk space specifically:**
+
+```bash
+grep DISK /etc/self-healing/config.conf          # current disk monitoring settings
+df -h /                                          # actual usage on a mountpoint (repeat per --disk-mounts)
+grep "DISK CHECK" /var/log/self-healing/events.log | tail   # last few disk checks logged
+cat /var/lib/self-healing/state/disk-root.state  # last alerted severity for "/" (OK/WARNING/CRITICAL/EMERGENCY)
+```
+
+The state file name follows the mountpoint: `/` → `disk-root.state`, `/data`
+→ `disk-data.state`, and so on (slashes become dashes).
 
 You'll also see a health summary automatically every time you (or
 anyone) logs into the server - it shows CPU/memory/disk, and flags any
@@ -319,3 +339,12 @@ really uses, then `sudo systemctl restart self-healing-watchdog.service`.
 Check the log for `suppressed (cooldown active)` - that's the DOWN
 cooldown working as designed, not a bug. Recovery alerts are never
 suppressed (see [Notifications](#6-notifications)).
+
+**"My disk alert is named `disk-root` / `disk-something` - what service is
+that?"**
+It's not a service - it's a mountpoint. The watchdog turns the mountpoint
+path into an alert name by stripping the leading `/` and turning any
+remaining `/` into `-`: `/` becomes `disk-root`, `/data` becomes
+`disk-data`, `/mnt/backups` becomes `disk-mnt-backups`. Match it back to
+`--disk-mounts` (or `DISK_MOUNTPOINTS` in `config.conf`) to see which
+mountpoint is actually alerting.
